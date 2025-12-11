@@ -1,0 +1,2816 @@
+// lib/chat_page.dart — UI/animation-focused makeover
+// NOTE: All networking / socket / data-manipulation methods are left intact.
+// Changes are limited to visuals, theming, and animations.
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'call_page.dart';
+import 'api.dart';
+import 'auth_store.dart';
+import 'login_page.dart';
+import 'socket_service.dart';
+import 'foreground_chat.dart';
+import 'file_service.dart';
+import 'voice_message_service.dart';
+import 'voice_message_player.dart';
+import 'emoji_picker_widget.dart';
+import 'config/app_config.dart';
+import 'widgets/call_activity_message.dart';
+import 'widgets/call_status_banner.dart';
+import 'models/call_log.dart';
+import 'services/call_log_service.dart';
+
+class ChatPage extends StatefulWidget {
+  final String? peerId;
+  final String partnerEmail;
+  final String? peerName;
+  final String? conversationId;
+
+  const ChatPage({
+    super.key,
+    this.peerId,
+    required this.partnerEmail,
+    this.peerName,
+    this.conversationId,
+  });
+
+  @override
+  State<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends State<ChatPage>
+    with SingleTickerProviderStateMixin {
+  final _input = TextEditingController();
+  final _inputFocusNode = FocusNode();
+  final _scroll = ScrollController();
+
+  String? myId;
+  String? peerId;
+  bool loading = true;
+  bool composerEnabled = false;
+  bool _sending = false;
+
+  bool _hasText = false;
+  bool _uploadingFile = false;
+  bool _showEmojiPicker = false;
+  bool _isRecordingVoice = false;
+
+  final List<Map<String, dynamic>> _items = [];
+  final FileService _fileService = FileService();
+  final VoiceMessageService _voiceService = VoiceMessageService();
+  final Set<String> _seenIds = <String>{};
+  final Set<String> _deletingIds = <String>{};
+  String? conversationId;
+
+  final Set<String> _pendingDeletedIds = <String>{};
+
+  DateTime? _deliveredUpToPeer;
+  DateTime? _readUpToPeer;
+
+  Timer? _readDebounce;
+  bool _peerOnline = false;
+  DateTime? _peerPresenceAt;
+  Timer? _presenceTicker;
+  bool _peerTyping = false;
+  Timer? _peerTypingClear;
+  DateTime _lastTypingSent = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _editingId;
+  String _editingOriginalText = '';
+  
+  // Reply functionality
+  Map<String, dynamic>? _replyingToMessage;
+  
+  // Select mode for multi-select
+  bool _isSelectMode = false;
+  final Set<String> _selectedMessageIds = <String>{};
+
+  // 🎨 Animation-only additions
+  late final AnimationController _presencePulse;
+  late final Animation<double> _presenceScale;
+  bool _showScrollToBottom = false;
+  
+  // Call status tracking for Viber-style banner
+  String? _activeCallId;
+  String? _activeCallStatus; // 'ringing', 'connecting', 'active'
+  bool _isActiveCallOutgoing = false;
+  bool _isActiveCallVideo = false;
+  Timer? _callStatusTimer;
+
+  void _markReadNow() {
+    if (conversationId == null || myId == null) return;
+    SocketService.I.emit('read_up_to', {
+      'conversationId': conversationId,
+      'by': myId,
+      'at': DateTime.now().toUtc().toIso8601String(),
+    });
+  }
+
+  // createdAt ကို cursor နှစ်ခု (_deliveredUpToPeer, _readUpToPeer) နဲ့နှိုင်းပြီး status ဆုံးဖြတ်
+  String _msgStatusFor(Map<String, dynamic> m) {
+    final createdIso = (m['createdAt'] ?? '').toString();
+    final created = DateTime.tryParse(createdIso);
+    if (created == null) return '';
+
+    final delivered =
+        _deliveredUpToPeer != null && !created.isAfter(_deliveredUpToPeer!);
+    final read = _readUpToPeer != null && !created.isAfter(_readUpToPeer!);
+
+    if (read) return 'seen';
+    if (delivered) return 'delivered';
+    return 'sent';
+  }
+
+  void _onEdited(dynamic data) {
+    final m = Map<String, dynamic>.from(data);
+    // gate by conversation (if known)
+    final cid = (m['conversationId'] ?? m['conversation'])?.toString();
+    if (conversationId != null && cid != null && cid != conversationId) return;
+
+    final mid = (m['_id'] ?? m['id'])?.toString() ?? '';
+    if (mid.isEmpty) return;
+
+    final idx = _items.indexWhere(
+      (e) => (e['_id'] ?? e['id']).toString() == mid,
+    );
+    if (idx >= 0) {
+      setState(() {
+        _items[idx]['text'] = (m['text'] ?? '').toString();
+        _items[idx]['edited'] = true;
+        _items[idx]['editedAt'] = m['editedAt'];
+      });
+    }
+  }
+
+  Color _msgStatusColor(String status) {
+    switch (status) {
+      case 'seen':
+        return Colors.white; // brightest
+      case 'delivered':
+        return Colors.white70; // medium
+      default:
+        return Colors.white54; // dimmest (sent)
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    peerId = widget.peerId;
+    conversationId = widget.conversationId;
+
+    _presencePulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat(reverse: true);
+
+    _presenceScale = Tween<double>(
+      begin: .85,
+      end: 1.15,
+    ).animate(CurvedAnimation(parent: _presencePulse, curve: Curves.easeInOut));
+
+    _scroll.addListener(() {
+      final atBottom =
+          _scroll.offset >=
+          (_scroll.position.maxScrollExtent - 64.0).clamp(0.0, double.infinity);
+      if (_showScrollToBottom == (!atBottom)) return;
+      setState(() => _showScrollToBottom = !atBottom);
+    });
+
+    _input.addListener(() {
+      final nowHasText = _input.text.trim().isNotEmpty;
+      if (nowHasText != _hasText) {
+        setState(() => _hasText = nowHasText);
+      }
+
+      // ✅ emit typing on changes
+      if (nowHasText) {
+        _sendTyping(true);
+      } else {
+        _sendTyping(false);
+      }
+    });
+    SocketService.I.off('call:incoming', _onCallIncoming);
+    SocketService.I.off('call:ringing', _onCallRinging);
+    SocketService.I.off('call:ended', _onCallEnded);
+    SocketService.I.off('call:answer', _onCallAnswer);
+    SocketService.I.off('call:hangup', _onCallHangup);
+    SocketService.I.off('message_edited', _onEdited);
+    SocketService.I.off('typing', _onTyping);
+    SocketService.I.off('presence', _onPresence);
+    SocketService.I.off('message', _onMessage);
+    SocketService.I.off('message_deleted', _onDeleted);
+    SocketService.I.off('chat_request_accepted', _onAccepted);
+    SocketService.I.off('delivered', _onDeliveredEvt);
+    SocketService.I.off('read_up_to', _onReadUpToEvt);
+    SocketService.I.on('call:incoming', _onCallIncoming);
+    SocketService.I.on('call:ringing', _onCallRinging);
+    SocketService.I.on('call:ended', _onCallEnded);
+    SocketService.I.on('call:answer', _onCallAnswer);
+    SocketService.I.on('call:hangup', _onCallHangup);
+    SocketService.I.on('call:declined', _onCallDeclined);
+    SocketService.I.on('call:answer', _onCallAnswer);
+    SocketService.I.on('call:hangup', _onCallHangup);
+    SocketService.I.on('message_edited', _onEdited);
+    SocketService.I.on('presence', _onPresence);
+    SocketService.I.on('message', _onMessage);
+    SocketService.I.on('message_deleted', _onDeleted);
+    SocketService.I.on('chat_request_accepted', _onAccepted);
+    SocketService.I.on('delivered', _onDeliveredEvt);
+    SocketService.I.on('read_up_to', _onReadUpToEvt);
+    SocketService.I.on('typing', _onTyping);
+
+    _presenceTicker = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (!_peerOnline && _peerPresenceAt != null && mounted) {
+        setState(() {});
+      }
+    });
+
+    _init();
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _fetchInitialPresence(),
+    );
+  }
+
+  Future<void> _init() async {
+    final u = await AuthStore.getUser();
+    if (u == null) return _logout();
+    myId = u['id'].toString();
+
+    if (peerId != null) {
+      ForegroundChat.currentPeerId = peerId;
+      composerEnabled = true;
+      await _loadHistory();
+      if (conversationId != null && conversationId!.isNotEmpty) {
+        _markReadNow();
+      }
+    } else {
+      await postJson('/chat-requests', {
+        'from': myId,
+        'toEmail': widget.partnerEmail,
+      });
+      composerEnabled = false;
+    }
+
+    setState(() => loading = false);
+    _scrollToBottom();
+    _markReadNow();
+  }
+
+  String _agoLabel(DateTime when) {
+    final now = DateTime.now();
+    final diff = now.difference(when);
+    if (diff.inSeconds < 10) return 'just now';
+    if (diff.inMinutes < 1) return '${diff.inSeconds}s ago';
+    if (diff.inHours < 1) return '${diff.inMinutes}m ago';
+    if (diff.inDays < 1) return '${diff.inHours}h ago';
+    final h = when.hour == 0
+        ? 12
+        : (when.hour > 12 ? when.hour - 12 : when.hour);
+    final mm = when.minute.toString().padLeft(2, '0');
+    final ampm = when.hour >= 12 ? 'pm' : 'am';
+    return '${when.month}/${when.day} $h:$mm $ampm';
+  }
+
+  void _onTyping(dynamic data) {
+    if (peerId == null) return;
+    final m = Map<String, dynamic>.from(data ?? {});
+    final from = (m['from'] ?? '').toString();
+    if (from != peerId) return; // only current peer
+    final typing = m['typing'] == true;
+
+    _peerTypingClear?.cancel();
+    setState(() => _peerTyping = typing);
+
+    // auto-hide after 4s if no further events
+    if (typing) {
+      _peerTypingClear = Timer(const Duration(seconds: 4), () {
+        if (mounted) setState(() => _peerTyping = false);
+      });
+    }
+  }
+
+  // Throttled "I'm typing" signal to server
+  void _sendTyping(bool typing) {
+    if (!composerEnabled || peerId == null) return;
+    final now = DateTime.now();
+    if (typing) {
+      // throttle ~1200ms
+      if (now.difference(_lastTypingSent).inMilliseconds < 1200) return;
+      _lastTypingSent = now;
+    }
+    SocketService.I.emit('typing', {
+      'to': peerId,
+      'conversationId': conversationId,
+      'typing': typing,
+    });
+  }
+
+  void _onPresence(dynamic data) {
+    if (peerId == null) return;
+    final m = Map<String, dynamic>.from(data);
+    final uid = (m['uid'] ?? '').toString();
+    if (uid != peerId) return;
+    final on = m['online'] == true;
+    final atStr = (m['at'] ?? '').toString();
+    final at = DateTime.tryParse(atStr)?.toLocal();
+    setState(() {
+      _peerOnline = on;
+      if (at != null) _peerPresenceAt = at;
+    });
+  }
+
+  void _onCallIncoming(dynamic data) {
+    // data: { callId, from, sdp, kind }
+    if (!mounted) return;
+    final m = Map<String, dynamic>.from(data ?? {});
+    final from = (m['from'] ?? '').toString();
+    final callId = (m['callId'] ?? '').toString();
+    final kind = (m['kind'] ?? 'audio').toString();
+
+    // Check if this call is for the current chat peer
+    if (peerId != null && from == peerId) {
+      // Update call status for banner
+      setState(() {
+        _activeCallId = callId;
+        _activeCallStatus = 'ringing';
+        _isActiveCallOutgoing = false;
+        _isActiveCallVideo = kind == 'video';
+      });
+      
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => CallPage(
+            peerId: peerId!,
+            peerName: widget.peerName ?? widget.partnerEmail,
+            outgoing: false, // 👈 incoming
+            video: kind == 'video',
+            initialCallId: callId,
+            initialOffer: m['sdp'],
+          ),
+        ),
+      ).then((_) {
+        // Clear call status when returning from call page
+        if (mounted) {
+          setState(() {
+            _activeCallId = null;
+            _activeCallStatus = null;
+          });
+        }
+      });
+    } else {
+      // Not for this chat - show notification
+      final who = from.isNotEmpty ? from : 'Someone';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('$who is calling…')));
+    }
+  }
+
+  void _onCallRinging(dynamic data) {
+    // data: { callId, to, kind }
+    if (!mounted) return;
+    final m = Map<String, dynamic>.from(data ?? {});
+    final callId = (m['callId'] ?? '').toString();
+    final to = (m['to'] ?? '').toString();
+    final kind = (m['kind'] ?? 'audio').toString();
+    
+    // Check if this is for the current peer
+    if (peerId != null && to == peerId) {
+      setState(() {
+        _activeCallId = callId;
+        _activeCallStatus = 'ringing';
+        _isActiveCallOutgoing = true;
+        _isActiveCallVideo = kind == 'video';
+      });
+    }
+  }
+
+  void _onCallEnded(dynamic data) {
+    // data: { callId, by }
+    if (!mounted) return;
+    final m = Map<String, dynamic>.from(data ?? {});
+    final callId = (m['callId'] ?? '').toString();
+    
+    // Clear call status if this call ended
+    if (_activeCallId == callId || _activeCallId == null) {
+      setState(() {
+        _activeCallId = null;
+        _activeCallStatus = null;
+      });
+      _callStatusTimer?.cancel();
+    }
+  }
+  
+  void _onCallAnswer(dynamic data) {
+    // data: { callId, from, sdp, kind } (from backend when call is accepted)
+    if (!mounted) return;
+    final m = Map<String, dynamic>.from(data ?? {});
+    final callId = (m['callId'] ?? '').toString();
+    
+    // Update call status when answered (this event is sent to caller when callee accepts)
+    if (_activeCallId == callId || (_activeCallId == null && callId.isNotEmpty)) {
+      setState(() {
+        _activeCallId = callId;
+        _activeCallStatus = 'connecting';
+        // Update to active after a short delay
+        _callStatusTimer?.cancel();
+        _callStatusTimer = Timer(const Duration(seconds: 2), () {
+          if (mounted && _activeCallId == callId) {
+            setState(() {
+              _activeCallStatus = 'active';
+            });
+          }
+        });
+      });
+    }
+  }
+  
+  void _onCallHangup(dynamic data) {
+    // data: { callId }
+    if (!mounted) return;
+    final m = Map<String, dynamic>.from(data ?? {});
+    final callId = (m['callId'] ?? '').toString();
+    
+    // Clear call status
+    if (_activeCallId == callId || _activeCallId == null) {
+      setState(() {
+        _activeCallId = null;
+        _activeCallStatus = null;
+      });
+      _callStatusTimer?.cancel();
+    }
+  }
+  
+  void _onCallDeclined(dynamic data) {
+    // data: { callId, from }
+    if (!mounted) return;
+    final m = Map<String, dynamic>.from(data ?? {});
+    final callId = (m['callId'] ?? '').toString();
+    
+    // Clear call status when declined
+    if (_activeCallId == callId || _activeCallId == null) {
+      setState(() {
+        _activeCallId = null;
+        _activeCallStatus = null;
+      });
+      _callStatusTimer?.cancel();
+    }
+  }
+
+  Future<void> _fetchInitialPresence() async {
+    if (peerId == null) return;
+    final r = await getJson(
+      '/presence?ids=$peerId&verbose=1',
+    ).timeout(const Duration(seconds: 8));
+    if (r.statusCode == 200) {
+      final map = Map<String, dynamic>.from(jsonDecode(r.body));
+      final obj = Map<String, dynamic>.from(map[peerId] ?? {});
+      final on = obj['online'] == true;
+      final at = DateTime.tryParse((obj['at'] ?? '').toString())?.toLocal();
+      setState(() {
+        _peerOnline = on;
+        _peerPresenceAt = at;
+      });
+    }
+  }
+
+  void _onDeliveredEvt(dynamic data) {
+    // data = { messageId, conversationId, by, at }
+    final m = Map<String, dynamic>.from(data ?? {});
+    final cid = (m['conversationId'] ?? '').toString();
+    final by = (m['by'] ?? '').toString(); // receiver uid
+    if (conversationId == null || cid != conversationId) return;
+    if (peerId == null || by != peerId) return;
+
+    final atIso = (m['at'] ?? '').toString();
+    final ts = DateTime.tryParse(atIso);
+    if (ts == null) return;
+
+    if (_deliveredUpToPeer == null || !ts.isBefore(_deliveredUpToPeer!)) {
+      setState(() => _deliveredUpToPeer = ts);
+    }
+  }
+
+  void _onReadUpToEvt(dynamic data) {
+    // data = { conversationId, by, at }
+    final m = Map<String, dynamic>.from(data ?? {});
+    final cid = (m['conversationId'] ?? '').toString();
+    final by = (m['by'] ?? '').toString();
+    if (conversationId == null || cid != conversationId) return;
+    if (peerId == null || by != peerId) return;
+
+    final atIso = (m['at'] ?? '').toString();
+    final ts = DateTime.tryParse(atIso);
+    if (ts == null) return;
+
+    setState(() {
+      _readUpToPeer = ts;
+      _deliveredUpToPeer =
+          (_deliveredUpToPeer == null || _deliveredUpToPeer!.isBefore(ts))
+          ? ts
+          : _deliveredUpToPeer;
+    });
+  }
+
+  Future<void> _loadCursorsOnce() async {
+    if (conversationId == null || myId == null || peerId == null) return;
+
+    final url = Uri.parse('$apiBase/conversations?me=$myId&status=active');
+    final r = await http.get(url, headers: await authHeaders());
+    if (r.statusCode != 200) return;
+    final list = (jsonDecode(r.body) as List).cast<Map<String, dynamic>>();
+    final it = list.firstWhere(
+      (e) => (e['_id']?.toString() ?? '') == conversationId,
+      orElse: () => {},
+    );
+    if (it.isEmpty) return;
+
+    final delivered = Map<String, dynamic>.from(it['deliveredUpTo'] ?? {});
+    final read = Map<String, dynamic>.from(it['readUpTo'] ?? {});
+    final dIso = (delivered[peerId] ?? '').toString();
+    final rIso = (read[peerId] ?? '').toString();
+
+    setState(() {
+      _deliveredUpToPeer = DateTime.tryParse(dIso);
+      _readUpToPeer = DateTime.tryParse(rIso);
+    });
+  }
+
+  void _onAccepted(dynamic data) async {
+    if (peerId != null) return;
+    final map = (data is Map) ? Map<String, dynamic>.from(data) : {};
+    final partnerId = map['partnerId']?.toString();
+    final cid = map['conversationId']?.toString();
+    if (partnerId == null) return;
+    peerId = partnerId;
+    if (cid != null && cid.isNotEmpty) conversationId = cid;
+    ForegroundChat.currentPeerId = peerId;
+    composerEnabled = true;
+    setState(() {});
+    await _loadHistory();
+    _scrollToBottom();
+  }
+
+  void _applyDeleteLocally(String id) {
+    final idx = _items.indexWhere(
+      (e) => (e['_id'] ?? e['id'] ?? '').toString() == id,
+    );
+    if (idx >= 0) {
+      _items[idx]['deleted'] = true;
+      _items[idx]['text'] = '';
+    }
+  }
+
+  void _onMessage(dynamic data) {
+    if (peerId == null && conversationId == null) return;
+    final m = Map<String, dynamic>.from(data);
+
+    final cid = (m['conversationId'] ?? m['conversation'])?.toString();
+    if (cid != null && cid.isNotEmpty) {
+      conversationId ??= cid; // adopt first time
+      if (conversationId != cid) return; // not this thread
+    } else {
+      final from = m['from']?.toString();
+      final to = m['to']?.toString();
+      final mine = myId;
+      if (mine == null) return;
+      final isThis = (peerId != null)
+          ? ((from == peerId && to == mine) || (to == peerId && from == mine))
+          : ((from == peerId) || (to == peerId));
+      if (!isThis) return;
+    }
+
+    final id = _extractMessageId(m);
+    if (id.isNotEmpty) {
+      if (_seenIds.contains(id)) return;
+      _seenIds.add(id);
+    }
+
+    // For call activity messages, verify they belong to this conversation
+    if (m['messageType']?.toString() == 'call_activity' || m['callActivity'] == true) {
+      final from = m['from']?.toString();
+      final to = m['to']?.toString();
+      final toEmail = m['toEmail']?.toString();
+      final msgConversationId = (m['conversationId'] ?? m['conversation'])?.toString();
+      
+      // First check by conversationId (most reliable)
+      if (conversationId != null && msgConversationId != null) {
+        if (msgConversationId != conversationId) {
+          debugPrint('Call activity message not for this conversation. MsgConvId: $msgConversationId, CurrentConvId: $conversationId');
+          return; // Skip messages not for this conversation
+        }
+      } else if (peerId != null && myId != null) {
+        // If no conversationId, check by participants
+        // The message should be between current user (myId) and this peer (peerId)
+        // Note: peerId might be email or user ID, so check both
+        final isFromMeToPeer = from == myId && (to == peerId || toEmail == widget.partnerEmail || toEmail == peerId);
+        final isFromPeerToMe = (from == peerId || from == widget.partnerEmail) && to == myId;
+        
+        if (!isFromMeToPeer && !isFromPeerToMe) {
+          debugPrint('Call activity message not for this chat. From: $from, To: $to, ToEmail: $toEmail, MyId: $myId, PeerId: $peerId, PartnerEmail: ${widget.partnerEmail}');
+          return; // Skip messages not for this conversation
+        }
+      } else {
+        // If we can't verify, skip to be safe
+        debugPrint('Cannot verify call activity message - skipping. PeerId: $peerId, ConversationId: $conversationId');
+        return;
+      }
+      
+      // Check for duplicates by callStartTime and participants
+      final callStartTime = m['callStartTime']?.toString();
+      if (callStartTime != null) {
+        final existing = _items.where((item) {
+          final itemStartTime = item['callStartTime']?.toString();
+          final itemId = (item['_id'] ?? item['id'] ?? '').toString();
+          final currentId = id.isNotEmpty ? id : '';
+          
+          final isCallActivity = (item['messageType']?.toString() == 'call_activity' || 
+                                  item['callActivity'] == true);
+          
+          // Check by ID first (most reliable)
+          if (currentId.isNotEmpty && itemId == currentId) {
+            return true;
+          }
+          
+          // Check by start time and participants (must match exactly)
+          if (isCallActivity && itemStartTime == callStartTime) {
+            // Check if same participants (in either direction)
+            final itemFrom = item['from']?.toString() ?? '';
+            final itemTo = item['to']?.toString() ?? '';
+            final itemToEmail = item['toEmail']?.toString() ?? '';
+            
+            // Match if same participants regardless of direction
+            final sameParticipants = 
+                (itemFrom == from && (itemTo == to || itemTo == toEmail || itemToEmail == to || itemToEmail == widget.partnerEmail)) ||
+                (itemFrom == to && itemTo == from) ||
+                (itemFrom == widget.partnerEmail && itemTo == myId);
+            
+            if (sameParticipants) {
+              debugPrint('Duplicate call activity detected: StartTime=$callStartTime, From=$from, To=$to, ItemFrom=$itemFrom, ItemTo=$itemTo');
+              return true;
+            }
+          }
+          
+          return false;
+        }).toList();
+        
+        if (existing.isNotEmpty) {
+          debugPrint('Duplicate call activity message detected, skipping. StartTime: $callStartTime, From: $from, To: $to');
+          return;
+        }
+      }
+    }
+
+    setState(() => _items.add(m));
+    _scrollToBottom();
+
+    final to = m['to']?.toString();
+    if (to == myId && id.isNotEmpty) {
+      SocketService.I.emit('delivered', {'messageId': id});
+      _markReadNow();
+    }
+  }
+
+  Future<void> _loadHistory() async {
+    if (myId == null) return;
+
+    Uri uri;
+    if (conversationId != null && conversationId!.isNotEmpty) {
+      uri = Uri.parse('$apiBase/messages?conversation=$conversationId');
+    } else if (peerId != null) {
+      uri = Uri.parse('$apiBase/messages?userA=$myId&userB=$peerId');
+    } else {
+      return;
+    }
+
+    final r = await http.get(uri, headers: await authHeaders());
+    if (r.statusCode == 200) {
+      final list = (jsonDecode(r.body) as List).cast<Map<String, dynamic>>();
+
+      for (final e in list) {
+        final id = (e['_id'] ?? e['id'] ?? '').toString();
+        if (_pendingDeletedIds.contains(id)) {
+          e['deleted'] = true;
+          e['text'] = '';
+        }
+      }
+
+      _items
+        ..clear()
+        ..addAll(list);
+      _seenIds
+        ..clear()
+        ..addAll(
+          list
+              .map((e) => (e['_id'] ?? e['id'] ?? '').toString())
+              .where((s) => s.isNotEmpty),
+        );
+
+      _pendingDeletedIds.removeWhere(
+        (id) =>
+            _items.any((e) => ((e['_id'] ?? e['id'] ?? '').toString() == id)),
+      );
+
+      if ((conversationId == null || conversationId!.isEmpty) &&
+          list.isNotEmpty) {
+        String adopted = '';
+        for (final e in list) {
+          final cid = (e['conversation'] ?? e['conversationId'] ?? '')
+              .toString();
+          if (cid.isNotEmpty) {
+            adopted = cid;
+            break;
+          }
+        }
+        if (adopted.isNotEmpty) {
+          conversationId = adopted;
+          _markReadNow();
+        }
+      }
+
+      await _loadCursorsOnce();
+
+      if (mounted) setState(() {});
+    } else if (r.statusCode == 401) {
+      _logout();
+    } else {
+      // optional: error toast/log
+    }
+  }
+
+  Future<void> _send({String? fileUrl, String? fileName, String? fileType, int? audioDuration}) async {
+    if (_sending || !composerEnabled) return;
+
+    final text = _input.text.trim();
+    if (text.isEmpty && fileUrl == null) return;
+
+    _input.clear();
+    _sendTyping(false);
+    _sending = true;
+    try {
+      final messageData = {
+        'from': myId,
+        'toEmail': widget.partnerEmail,
+        'text': text.isNotEmpty ? text : (fileUrl != null ? '📎 ${fileName ?? "File"}' : ''),
+      };
+      
+      if (fileUrl != null) {
+        messageData['fileUrl'] = fileUrl;
+        messageData['fileName'] = fileName;
+        messageData['fileType'] = fileType;
+        if (audioDuration != null) {
+          messageData['audioDuration'] = audioDuration.toString();
+        }
+      }
+
+      final res = await postJson('/messages', messageData);
+
+      if (!mounted) return;
+
+      if (res.statusCode != 200) {
+        final msg = res.statusCode == 403
+            ? 'Receiver has not accepted your request yet.'
+            : res.statusCode == 404
+            ? 'Recipient not found.'
+            : 'Send failed (${res.statusCode})';
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(msg)));
+        return;
+      }
+
+      try {
+        final body = jsonDecode(res.body) as Map<String, dynamic>;
+        final payload = Map<String, dynamic>.from(body['message'] ?? {});
+        if (payload.isNotEmpty) {
+          final id = _extractMessageId(payload);
+          if (id.isNotEmpty && !_seenIds.contains(id)) {
+            _seenIds.add(id);
+            setState(() => _items.add(payload));
+            _scrollToBottom();
+          }
+          final cid =
+              (payload['conversationId'] ?? payload['conversation'] ?? '')
+                  .toString();
+          if (cid.isNotEmpty) conversationId = cid;
+        }
+      } catch (_) {
+        /* ignore; rely on socket */
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Network error: $e')));
+    } finally {
+      _sending = false;
+    }
+  }
+
+  Future<void> _pickAndSendImage(ImageSource source) async {
+    if (_uploadingFile || !composerEnabled) return;
+    
+    setState(() => _uploadingFile = true);
+    try {
+      final XFile? image = await _fileService.pickImage(source: source);
+      if (image == null || !mounted) {
+        setState(() => _uploadingFile = false);
+        return;
+      }
+
+      // Show uploading indicator
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              SizedBox(width: 12),
+              Text('Uploading image...'),
+            ],
+          ),
+          duration: Duration(seconds: 30),
+        ),
+      );
+
+      final fileUrl = await _fileService.uploadImage(image);
+      if (!mounted) {
+        setState(() => _uploadingFile = false);
+        return;
+      }
+
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+      if (fileUrl != null) {
+        await _send(
+          fileUrl: fileUrl,
+          fileName: image.name,
+          fileType: 'image',
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to upload image')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    } finally {
+      setState(() => _uploadingFile = false);
+    }
+  }
+
+  Future<void> _pickAndSendFile() async {
+    if (_uploadingFile || !composerEnabled) return;
+    
+    setState(() => _uploadingFile = true);
+    try {
+      final file = await _fileService.pickFile();
+      if (file == null || file.path == null || !mounted) {
+        setState(() => _uploadingFile = false);
+        return;
+      }
+
+      // Show uploading indicator
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text('Uploading ${file.name}...'),
+              ),
+            ],
+          ),
+          duration: const Duration(seconds: 60),
+        ),
+      );
+
+      final fileUrl = await _fileService.uploadPlatformFile(file);
+      if (!mounted) {
+        setState(() => _uploadingFile = false);
+        return;
+      }
+
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+      if (fileUrl != null) {
+        await _send(
+          fileUrl: fileUrl,
+          fileName: file.name,
+          fileType: file.extension ?? 'file',
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to upload file')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    } finally {
+      setState(() => _uploadingFile = false);
+    }
+  }
+
+  void _showAttachmentOptions() {
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library),
+              title: const Text('Photo from Gallery'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAndSendImage(ImageSource.gallery);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.camera_alt),
+              title: const Text('Take Photo'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAndSendImage(ImageSource.camera);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file),
+              title: const Text('Choose File'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAndSendFile();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _scroll.animateTo(
+        _scroll.position.maxScrollExtent + 120,
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOutCubic,
+      );
+      _markReadNow();
+    });
+  }
+
+  String _extractMessageId(Map<String, dynamic> m) {
+    final candidates = [
+      m['_id'],
+      m['id'],
+      m['messageId'],
+      m['msgId'],
+      (m['message'] is Map) ? (m['message'] as Map)['_id'] : null,
+    ];
+    for (final c in candidates) {
+      if (c == null) continue;
+      final s = c.toString();
+      if (s.isNotEmpty) return s;
+    }
+    return '';
+  }
+
+  void _startEdit(Map<String, dynamic> m) {
+    final id = (m['_id'] ?? m['id'] ?? '').toString();
+    if (id.isEmpty) return;
+    final myText = (m['text'] ?? '').toString();
+    _editingId = id;
+    _editingOriginalText = myText;
+    _input.text = myText;
+
+    _input.selection = TextSelection.fromPosition(
+      TextPosition(offset: _input.text.length),
+    );
+    setState(() {});
+  }
+
+  Future<void> _saveEdit() async {
+    if (_editingId == null) return;
+    final newText = _input.text.trim();
+    if (newText.isEmpty) return;
+
+    final url = Uri.parse('$apiBase/messages/${_editingId}');
+    final r = await http.patch(
+      url,
+      headers: await authHeaders(),
+      body: jsonEncode({'text': newText}),
+    );
+
+    if (!mounted) return;
+
+    if (r.statusCode == 200) {
+      final idx = _items.indexWhere(
+        (e) => (e['_id'] ?? e['id'] ?? '').toString() == _editingId,
+      );
+      if (idx >= 0) {
+        setState(() {
+          _items[idx]['text'] = newText;
+          _items[idx]['edited'] = true;
+          _items[idx]['editedAt'] = DateTime.now().toUtc().toIso8601String();
+        });
+      }
+      _cancelEdit();
+    } else {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Edit failed (${r.statusCode})')));
+    }
+  }
+
+  void _cancelEdit() {
+    _editingId = null;
+    _editingOriginalText = '';
+    _input.clear();
+    setState(() {});
+  }
+  
+  void _cancelReply() {
+    _replyingToMessage = null;
+    setState(() {});
+  }
+  
+  void _startReply(Map<String, dynamic> message) {
+    _replyingToMessage = message;
+    _inputFocusNode.requestFocus();
+    setState(() {});
+  }
+  
+  Future<void> _copyMessage(Map<String, dynamic> message) async {
+    final text = message['text']?.toString() ?? '';
+    if (text.isNotEmpty) {
+      await Clipboard.setData(ClipboardData(text: text));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Message copied to clipboard'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+  
+  Future<void> _forwardMessage(Map<String, dynamic> message) async {
+    // TODO: Implement forward to another chat
+    // For now, show a dialog
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Forward feature coming soon')),
+      );
+    }
+  }
+  
+  Future<void> _pinMessage(String messageId) async {
+    // TODO: Implement pin message (requires backend support)
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Pin feature coming soon')),
+      );
+    }
+  }
+  
+  void _toggleSelectMode() {
+    setState(() {
+      _isSelectMode = !_isSelectMode;
+      if (!_isSelectMode) {
+        _selectedMessageIds.clear();
+      }
+    });
+  }
+  
+  void _toggleMessageSelection(String messageId) {
+    setState(() {
+      if (_selectedMessageIds.contains(messageId)) {
+        _selectedMessageIds.remove(messageId);
+      } else {
+        _selectedMessageIds.add(messageId);
+      }
+      if (_selectedMessageIds.isEmpty) {
+        _isSelectMode = false;
+      }
+    });
+  }
+  
+  Future<void> _deleteSelectedMessages() async {
+    if (_selectedMessageIds.isEmpty) return;
+    
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('Delete ${_selectedMessageIds.length} message${_selectedMessageIds.length > 1 ? 's' : ''}?'),
+        content: const Text('This will delete the messages for everyone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    
+    if (ok == true) {
+      for (final id in _selectedMessageIds) {
+        await _deleteMessage(id);
+      }
+      setState(() {
+        _selectedMessageIds.clear();
+        _isSelectMode = false;
+      });
+    }
+  }
+  
+  Future<String?> _showMessageActionMenu(Map<String, dynamic> message, bool isMine) async {
+    return await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (context) => Container(
+        decoration: BoxDecoration(
+          color: Theme.of(context).scaffoldBackgroundColor,
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(20),
+            topRight: Radius.circular(20),
+          ),
+        ),
+        child: SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Handle bar
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 8),
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              // Message preview
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      isMine ? Icons.person : Icons.person_outline,
+                      size: 20,
+                      color: Colors.grey.shade600,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        message['text']?.toString() ?? 'Message',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.grey.shade700,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              // Action buttons
+              ListTile(
+                leading: Icon(Icons.reply, color: Theme.of(context).colorScheme.primary),
+                title: const Text('Reply'),
+                onTap: () => Navigator.pop(context, 'reply'),
+              ),
+              ListTile(
+                leading: Icon(Icons.content_copy, color: Theme.of(context).colorScheme.primary),
+                title: const Text('Copy'),
+                onTap: () => Navigator.pop(context, 'copy'),
+              ),
+              ListTile(
+                leading: Icon(Icons.forward, color: Theme.of(context).colorScheme.primary),
+                title: const Text('Forward'),
+                onTap: () => Navigator.pop(context, 'forward'),
+              ),
+              ListTile(
+                leading: Icon(Icons.push_pin, color: Theme.of(context).colorScheme.primary),
+                title: const Text('Pin'),
+                onTap: () => Navigator.pop(context, 'pin'),
+              ),
+              ListTile(
+                leading: Icon(Icons.select_all, color: Theme.of(context).colorScheme.primary),
+                title: const Text('Select'),
+                onTap: () => Navigator.pop(context, 'select'),
+              ),
+              if (isMine) ...[
+                const Divider(height: 1),
+                ListTile(
+                  leading: Icon(Icons.edit, color: Theme.of(context).colorScheme.primary),
+                  title: const Text('Edit'),
+                  onTap: () => Navigator.pop(context, 'edit'),
+                ),
+              ],
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: Colors.red),
+                title: const Text(
+                  'Delete',
+                  style: TextStyle(color: Colors.red, fontWeight: FontWeight.w500),
+                ),
+                onTap: () => Navigator.pop(context, 'delete'),
+              ),
+              SizedBox(height: MediaQuery.of(context).padding.bottom),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _onDeleted(dynamic data) async {
+    final m = Map<String, dynamic>.from(data);
+    final id = _extractMessageId(m);
+    if (id.isEmpty) return;
+
+    final cid = m['conversationId']?.toString();
+    if (conversationId != null && cid != null && cid != conversationId) return;
+
+    final idx = _items.indexWhere(
+      (e) => (e['_id']?.toString() == id) || (e['id']?.toString() == id),
+    );
+    if (idx >= 0) {
+      if (!mounted) return;
+      setState(() {
+        _items[idx]['deleted'] = true;
+        _items[idx]['text'] = '';
+        _deletingIds.remove(id);
+      });
+      return;
+    }
+
+    _pendingDeletedIds.add(id);
+    await _reconcileDeleted(id);
+  }
+
+  Future<void> _deleteMessage(String id) async {
+    setState(() => _deletingIds.add(id));
+
+    final r = await http.delete(
+      Uri.parse('$apiBase/messages/$id'),
+      headers: await authHeaders(),
+    );
+
+    if (r.statusCode == 200) {
+      try {
+        final body = jsonDecode(r.body) as Map<String, dynamic>;
+        final mid = (body['message']?['_id'] ?? body['message']?['id'] ?? id)
+            .toString();
+        setState(() {
+          _applyDeleteLocally(mid);
+          _deletingIds.remove(mid);
+        });
+      } catch (_) {
+        setState(() {
+          _applyDeleteLocally(id);
+          _deletingIds.remove(id);
+        });
+      }
+    } else {
+      if (!mounted) return;
+      setState(() => _deletingIds.remove(id));
+      final msg = r.statusCode == 403
+          ? 'Only the sender can delete this message'
+          : 'Delete failed (${r.statusCode})';
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    }
+  }
+
+  Future<void> _reconcileDeleted(String id) async {
+    await _loadHistory();
+    if (!mounted) return;
+    setState(() {
+      _applyDeleteLocally(id);
+      _deletingIds.remove(id);
+    });
+  }
+
+  Future<void> _logout() async {
+    await AuthStore.clear();
+    SocketService.I.disconnect();
+    if (!mounted) return;
+    Navigator.pushAndRemoveUntil(
+      context,
+      MaterialPageRoute(builder: (_) => const LoginPage()),
+      (_) => false,
+    );
+  }
+
+  @override
+  void dispose() {
+    _peerTypingClear?.cancel();
+    _presenceTicker?.cancel();
+    _readDebounce?.cancel();
+    _presencePulse.dispose();
+    _input.dispose();
+    _scroll.dispose();
+    _voiceService.dispose();
+    SocketService.I.off('call:incoming', _onCallIncoming);
+    SocketService.I.off('call:ringing', _onCallRinging);
+    SocketService.I.off('call:ended', _onCallEnded);
+    SocketService.I.off('call:answer', _onCallAnswer);
+    SocketService.I.off('call:hangup', _onCallHangup);
+    SocketService.I.off('call:declined', _onCallDeclined);
+    _callStatusTimer?.cancel();
+    SocketService.I.off('message', _onMessage);
+    SocketService.I.off('chat_request_accepted', _onAccepted);
+    SocketService.I.off('message_deleted', _onDeleted);
+    SocketService.I.off('delivered', _onDeliveredEvt);
+    SocketService.I.off('read_up_to', _onReadUpToEvt);
+    SocketService.I.off('presence', _onPresence);
+    SocketService.I.off('typing', _onTyping);
+    SocketService.I.off('message_edited', _onEdited);
+    ForegroundChat.currentPeerId = null;
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final title = widget.peerName?.trim().isNotEmpty == true
+        ? widget.peerName!.trim()
+        : widget.partnerEmail;
+
+    final bool canSend = composerEnabled && _hasText;
+
+    // Viber-style subtle background gradient
+    final gradientBg = LinearGradient(
+      colors: [
+        const Color(0xFFF0F0F0), // Light gray
+        const Color(0xFFE8E8E8), // Slightly darker gray
+      ],
+      begin: Alignment.topLeft,
+      end: Alignment.bottomRight,
+    );
+
+    return Scaffold(
+      extendBody: true,
+      appBar: _isSelectMode
+          ? AppBar(
+              title: Text('${_selectedMessageIds.length} selected'),
+              leading: IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: () {
+                  setState(() {
+                    _isSelectMode = false;
+                    _selectedMessageIds.clear();
+                  });
+                },
+              ),
+              actions: [
+                if (_selectedMessageIds.isNotEmpty)
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    color: Colors.red,
+                    onPressed: _deleteSelectedMessages,
+                  ),
+              ],
+            )
+          : AppBar(
+              elevation: 0,
+              titleSpacing: 0,
+        title: Row(
+          children: [
+            const SizedBox(width: 4),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 2),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      ScaleTransition(
+                        scale: _peerOnline
+                            ? _presenceScale
+                            : const AlwaysStoppedAnimation(1.0),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 300),
+                          width: 10,
+                          height: 10,
+                          decoration: BoxDecoration(
+                            color: _peerOnline ? Colors.green : Colors.red,
+                            shape: BoxShape.circle,
+                            boxShadow: _peerOnline
+                                ? const [
+                                    BoxShadow(
+                                      blurRadius: 8,
+                                      spreadRadius: 1,
+                                      color: Colors.greenAccent,
+                                    ),
+                                  ]
+                                : const [],
+                          ),
+                        ),
+                      ),
+
+                      const SizedBox(width: 6),
+                      AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 250),
+                        transitionBuilder: (c, a) => FadeTransition(
+                          opacity: a,
+                          child: SlideTransition(
+                            position: a.drive(
+                              Tween(
+                                begin: const Offset(.1, 0),
+                                end: Offset.zero,
+                              ),
+                            ),
+                            child: c,
+                          ),
+                        ),
+                        child: Text(
+                          _peerTyping
+                              ? 'typing…'
+                              : (_peerOnline
+                                    ? 'online'
+                                    : (_peerPresenceAt != null
+                                          ? 'last seen ${_agoLabel(_peerPresenceAt!)}'
+                                          : 'offline')),
+                          key: ValueKey(
+                            _peerTyping.toString() +
+                                _peerOnline.toString() +
+                                (_peerPresenceAt?.toIso8601String() ?? ''),
+                          ),
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(
+                                fontStyle: _peerTyping
+                                    ? FontStyle.italic
+                                    : FontStyle.normal,
+                                color: _peerTyping
+                                    ? Theme.of(context).colorScheme.primary
+                                    : Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                              ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.videocam),
+            tooltip: 'Video call',
+            onPressed: (peerId != null && composerEnabled)
+                ? () {
+                    // Track outgoing call
+                    setState(() {
+                      _activeCallStatus = 'ringing';
+                      _isActiveCallOutgoing = true;
+                      _isActiveCallVideo = true;
+                    });
+                    
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => CallPage(
+                          peerId: peerId!,
+                          peerName: widget.peerName ?? widget.partnerEmail,
+                          outgoing: true,
+                          video: true, // 👈 request video
+                        ),
+                      ),
+                    ).then((_) {
+                      // Clear call status when returning
+                      if (mounted) {
+                        setState(() {
+                          _activeCallId = null;
+                          _activeCallStatus = null;
+                        });
+                      }
+                    });
+                  }
+                : null,
+          ),
+          IconButton(
+            icon: const Icon(Icons.call),
+            tooltip: 'Voice call',
+            onPressed: (peerId != null && composerEnabled)
+                ? () {
+                    // Track outgoing call
+                    setState(() {
+                      _activeCallStatus = 'ringing';
+                      _isActiveCallOutgoing = true;
+                      _isActiveCallVideo = false;
+                    });
+                    
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => CallPage(
+                          peerId: peerId!,
+                          peerName: widget.peerName ?? widget.partnerEmail,
+                          outgoing: true,
+                          video: false, // 👈 audio-only
+                        ),
+                      ),
+                    ).then((_) {
+                      // Clear call status when returning
+                      if (mounted) {
+                        setState(() {
+                          _activeCallId = null;
+                          _activeCallStatus = null;
+                        });
+                      }
+                    });
+                  }
+                : null,
+          ),
+        ],
+      ),
+
+      body: Container(
+        decoration: BoxDecoration(gradient: gradientBg),
+        child: Column(
+          children: [
+            // Viber-style call status banner
+            if (_activeCallId != null && _activeCallStatus != null)
+              CallStatusBanner(
+                peerName: widget.peerName ?? widget.partnerEmail,
+                isVideoCall: _isActiveCallVideo,
+                isOutgoing: _isActiveCallOutgoing,
+                status: _activeCallStatus!,
+                onReturnToCall: () {
+                  // Navigate back to call page
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => CallPage(
+                        peerId: peerId!,
+                        peerName: widget.peerName ?? widget.partnerEmail,
+                        outgoing: _isActiveCallOutgoing,
+                        video: _isActiveCallVideo,
+                        initialCallId: _activeCallId,
+                      ),
+                    ),
+                  );
+                },
+                onEndCall: () {
+                  // End the call
+                  SocketService.I.emit('call:hangup', {'callId': _activeCallId});
+                  setState(() {
+                    _activeCallId = null;
+                    _activeCallStatus = null;
+                  });
+                },
+              ),
+            if (!composerEnabled)
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.amber.withOpacity(.15),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.hourglass_top, size: 18),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Pending… receiver must accept your request.',
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            // Reply preview
+            if (_replyingToMessage != null)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                margin: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.3),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border(
+                    left: BorderSide(
+                      color: Theme.of(context).colorScheme.primary,
+                      width: 3,
+                    ),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.reply,
+                      size: 18,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            _replyingToMessage!['from']?.toString() == myId
+                                ? 'You'
+                                : (widget.peerName ?? widget.partnerEmail),
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 12,
+                              color: Theme.of(context).colorScheme.primary,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            _replyingToMessage!['text']?.toString() ?? 'Message',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: _cancelReply,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                    ),
+                  ],
+                ),
+              ),
+            if (_editingId != null)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                margin: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withOpacity(.15),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.edit, size: 16),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Editing…',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _cancelEdit,
+                      child: const Text('Cancel'),
+                    ),
+                  ],
+                ),
+              ),
+            Expanded(
+              child: Stack(
+                children: [
+                  loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : ListView.builder(
+                          controller: _scroll,
+                          padding: const EdgeInsets.fromLTRB(12, 12, 12, 96),
+                          itemCount: _items.length,
+                          itemBuilder: (_, i) {
+                            final m = _items[i];
+                            final id = (m['_id'] ?? m['id'] ?? '').toString();
+                            final mine = m['from']?.toString() == myId;
+                            final isDeleted = (m['deleted'] == true);
+                            final deleting =
+                                _deletingIds.contains(id) && !isDeleted;
+                            final createdAt = _fmtTime(
+                              m['createdAt']?.toString(),
+                            );
+                            final edited = (m['edited'] == true);
+                            final fileUrl = m['fileUrl']?.toString();
+                            final fileName = m['fileName']?.toString();
+                            final fileType = m['fileType']?.toString();
+                            final hasFile = fileUrl != null && fileUrl.isNotEmpty;
+                            final isImage = hasFile && (fileType == 'image' || _fileService.isImageFile(fileName));
+                            final isVoice = hasFile && (fileType == 'audio' || fileType == 'voice' || (fileName?.endsWith('.m4a') ?? false) || (fileName?.endsWith('.mp3') ?? false));
+                            
+                            // Check if this is a call activity message
+                            final text = m['text']?.toString() ?? '';
+                            final isCallActivity = m['messageType']?.toString() == 'call_activity' ||
+                                m['callActivity'] == true ||
+                                text.startsWith('📞') ||
+                                (text.contains('call') && 
+                                 (text.contains('missed') ||
+                                  text.contains('declined') ||
+                                  text.contains('cancelled')));
+
+                            // Slide+fade-in per item
+                            return TweenAnimationBuilder<double>(
+                              key: ValueKey(
+                                id.isNotEmpty ? id : '$i-${m['createdAt']}',
+                              ),
+                              tween: Tween(begin: 1, end: 0),
+                              duration: const Duration(milliseconds: 320),
+                              curve: Curves.easeOutCubic,
+                              builder: (context, value, child) => Opacity(
+                                opacity: (1 - value).clamp(0, 1),
+                                child: Transform.translate(
+                                  offset: Offset(0, 12 * value),
+                                  child: child,
+                                ),
+                              ),
+                              child: isCallActivity
+                                  ? _buildCallActivityMessage(m, mine)
+                                  : Align(
+                                      alignment: mine
+                                          ? Alignment.centerRight
+                                          : Alignment.centerLeft,
+                                      child: GestureDetector(
+                                  onTap: _isSelectMode && !isCallActivity
+                                      ? () => _toggleMessageSelection(id)
+                                      : null,
+                                  onLongPress:
+                                      (!isDeleted &&
+                                          composerEnabled &&
+                                          !deleting &&
+                                          !isCallActivity) // Call activity messages are NOT editable/deletable
+                                      ? () async {
+                                          if (_isSelectMode) {
+                                            _toggleMessageSelection(id);
+                                            return;
+                                          }
+                                          
+                                          final action =
+                                              await _showMessageActionMenu(m, mine);
+                                          
+                                          if (action == 'reply') {
+                                            _startReply(m);
+                                          } else if (action == 'copy') {
+                                            await _copyMessage(m);
+                                          } else if (action == 'forward') {
+                                            await _forwardMessage(m);
+                                          } else if (action == 'pin') {
+                                            await _pinMessage(id);
+                                          } else if (action == 'select') {
+                                            _toggleSelectMode();
+                                            _toggleMessageSelection(id);
+                                          } else if (action == 'edit') {
+                                            _startEdit(m);
+                                          } else if (action == 'delete') {
+                                            final ok = await showDialog<bool>(
+                                              context: context,
+                                              builder: (_) => AlertDialog(
+                                                title: const Text('Delete message?'),
+                                                content: const Text(
+                                                  'This will delete the message for everyone.',
+                                                ),
+                                                actions: [
+                                                  TextButton(
+                                                    onPressed: () =>
+                                                        Navigator.pop(context, false),
+                                                    child: const Text('Cancel'),
+                                                  ),
+                                                  FilledButton(
+                                                    onPressed: () =>
+                                                        Navigator.pop(context, true),
+                                                    style: FilledButton.styleFrom(
+                                                      backgroundColor: Colors.red,
+                                                    ),
+                                                    child: const Text('Delete'),
+                                                  ),
+                                                ],
+                                              ),
+                                            );
+                                            if (ok == true) await _deleteMessage(id);
+                                          }
+                                        }
+                                      : null,
+                                  child: Stack(
+                                    children: [
+                                      // Selection checkbox overlay
+                                      if (_isSelectMode && !isCallActivity)
+                                        Align(
+                                          alignment: Alignment.centerLeft,
+                                          child: Padding(
+                                            padding: const EdgeInsets.only(left: 8, right: 8),
+                                            child: Checkbox(
+                                              value: _selectedMessageIds.contains(id),
+                                              onChanged: (_) => _toggleMessageSelection(id),
+                                              shape: const CircleBorder(),
+                                            ),
+                                          ),
+                                        ),
+                                      AnimatedContainer(
+                                        duration: const Duration(milliseconds: 220),
+                                        margin: EdgeInsets.symmetric(
+                                          vertical: 4,
+                                          horizontal: _isSelectMode ? 40 : 0,
+                                        ),
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 10,
+                                          horizontal: 14,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          gradient: isDeleted
+                                              ? null
+                                              : LinearGradient(
+                                                  colors: mine
+                                                      ? [
+                                                          // Viber blue gradient for sent messages
+                                                          const Color(0xFF3A7BD5),
+                                                          const Color(0xFF4A90E2),
+                                                        ]
+                                                      : [
+                                                          // Viber white/light gray for received messages
+                                                          Colors.white,
+                                                          const Color(0xFFF5F5F5),
+                                                        ],
+                                                  begin: Alignment.topLeft,
+                                                  end: Alignment.bottomRight,
+                                                ),
+                                          color: isDeleted
+                                              ? Colors.grey.shade400
+                                              : (_selectedMessageIds.contains(id)
+                                                  ? Theme.of(context).colorScheme.primary.withOpacity(0.1)
+                                                  : null),
+                                          borderRadius: BorderRadius.only(
+                                            topLeft: const Radius.circular(18),
+                                            topRight: const Radius.circular(18),
+                                            bottomLeft: Radius.circular(mine ? 18 : 4),
+                                            bottomRight: Radius.circular(mine ? 4 : 18),
+                                          ),
+                                          border: !mine && !isDeleted
+                                              ? Border.all(
+                                                  color: Colors.grey.shade300,
+                                                  width: 0.5,
+                                                )
+                                              : null,
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: mine
+                                                  ? const Color(0xFF3A7BD5).withOpacity(0.15)
+                                                  : Colors.black.withOpacity(0.08),
+                                              blurRadius: 12,
+                                              spreadRadius: 0.5,
+                                              offset: const Offset(0, 4),
+                                            ),
+                                          ],
+                                        ),
+                                        child: Column(
+                                          crossAxisAlignment: mine
+                                              ? CrossAxisAlignment.end
+                                              : CrossAxisAlignment.start,
+                                          children: [
+                                        // File/Image/Voice display
+                                        if (hasFile && !isDeleted) ...[
+                                          const SizedBox(height: 4),
+                                          if (isVoice)
+                                            VoiceMessagePlayer(
+                                              audioUrl: fileUrl!,
+                                              isMe: mine,
+                                              duration: m['audioDuration'] as int?,
+                                            )
+                                          else if (isImage)
+                                            ClipRRect(
+                                              borderRadius: BorderRadius.circular(8),
+                                              child: GestureDetector(
+                                                onTap: () {
+                                                  Navigator.push(
+                                                    context,
+                                                    MaterialPageRoute(
+                                                      builder: (_) => Scaffold(
+                                                        appBar: AppBar(
+                                                          title: Text(fileName ?? 'Image'),
+                                                        ),
+                                                        body: Center(
+                                                          child: InteractiveViewer(
+                                                            child: Image.network(
+                                                              fileUrl!,
+                                                              fit: BoxFit.contain,
+                                                              errorBuilder: (_, __, ___) => const Icon(
+                                                                Icons.broken_image,
+                                                                size: 64,
+                                                                color: Colors.white,
+                                                              ),
+                                                              loadingBuilder: (_, child, progress) {
+                                                                if (progress == null) return child;
+                                                                return const Center(
+                                                                  child: CircularProgressIndicator(),
+                                                                );
+                                                              },
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  );
+                                                },
+                                                child: Image.network(
+                                                  fileUrl!,
+                                                  width: 200,
+                                                  height: 200,
+                                                  fit: BoxFit.cover,
+                                                  errorBuilder: (_, __, ___) => Container(
+                                                    width: 200,
+                                                    height: 200,
+                                                    color: Colors.grey[800],
+                                                    child: const Icon(
+                                                      Icons.broken_image,
+                                                      size: 48,
+                                                      color: Colors.white54,
+                                                    ),
+                                                  ),
+                                                  loadingBuilder: (_, child, progress) {
+                                                    if (progress == null) return child;
+                                                    return Container(
+                                                      width: 200,
+                                                      height: 200,
+                                                      color: Colors.grey[800],
+                                                      child: const Center(
+                                                        child: CircularProgressIndicator(
+                                                          strokeWidth: 2,
+                                                          color: Colors.white54,
+                                                        ),
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              ),
+                                            )
+                                          else
+                                            Container(
+                                              padding: const EdgeInsets.all(12),
+                                              decoration: BoxDecoration(
+                                                color: Colors.white.withOpacity(0.2),
+                                                borderRadius: BorderRadius.circular(8),
+                                              ),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(
+                                                    _fileService.getFileIcon(fileName),
+                                                    color: Colors.white,
+                                                    size: 32,
+                                                  ),
+                                                  const SizedBox(width: 12),
+                                                  Flexible(
+                                                    child: Column(
+                                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                                      children: [
+                                                        Text(
+                                                          fileName ?? 'File',
+                                                          style: const TextStyle(
+                                                            color: Colors.white,
+                                                            fontSize: 14,
+                                                            fontWeight: FontWeight.w500,
+                                                          ),
+                                                          maxLines: 1,
+                                                          overflow: TextOverflow.ellipsis,
+                                                        ),
+                                                        if (m['fileSize'] != null)
+                                                          Text(
+                                                            _fileService.formatFileSize(
+                                                              int.tryParse(m['fileSize'].toString()) ?? 0,
+                                                            ),
+                                                            style: const TextStyle(
+                                                              color: Colors.white70,
+                                                              fontSize: 12,
+                                                            ),
+                                                          ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 8),
+                                                  IconButton(
+                                                    icon: const Icon(Icons.download, color: Colors.white),
+                                                    onPressed: () {
+                                                      // TODO: Implement file download
+                                                      ScaffoldMessenger.of(context).showSnackBar(
+                                                        SnackBar(content: Text('Download: $fileUrl')),
+                                                      );
+                                                    },
+                                                    padding: EdgeInsets.zero,
+                                                    constraints: const BoxConstraints(),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          const SizedBox(height: 8),
+                                        ],
+                                        // Text content
+                                        AnimatedSwitcher(
+                                          duration: const Duration(
+                                            milliseconds: 150,
+                                          ),
+                                          child: isDeleted
+                                              ? Row(
+                                                  key: const ValueKey(
+                                                    'deleted',
+                                                  ),
+                                                  mainAxisSize:
+                                                      MainAxisSize.min,
+                                                  children: [
+                                                    Icon(
+                                                      Icons.delete_outline,
+                                                      size: 16,
+                                                      color: mine ? Colors.white70 : Colors.black54,
+                                                    ),
+                                                    const SizedBox(width: 6),
+                                                    Text(
+                                                      'Message deleted',
+                                                      style: TextStyle(
+                                                        color: mine ? Colors.white70 : Colors.black54,
+                                                        fontStyle: FontStyle.italic,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                )
+                                              : (deleting
+                                                    ? Row(
+                                                        key: const ValueKey(
+                                                          'deleting',
+                                                        ),
+                                                        mainAxisSize:
+                                                            MainAxisSize.min,
+                                                        children: [
+                                                          SizedBox(
+                                                            width: 14,
+                                                            height: 14,
+                                                            child: CircularProgressIndicator(
+                                                              strokeWidth: 2,
+                                                              color: mine ? Colors.white70 : Colors.black54,
+                                                            ),
+                                                          ),
+                                                          const SizedBox(width: 8),
+                                                          Text(
+                                                            'Deleting…',
+                                                            style: TextStyle(
+                                                              color: mine ? Colors.white70 : Colors.black54,
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      )
+                                                    : (m['text']?.toString().isNotEmpty == true
+                                                        ? Text(
+                                                            m['text']?.toString() ?? '',
+                                                            key: const ValueKey('text'),
+                                                            style: TextStyle(
+                                                              fontSize: 15,
+                                                              color: mine ? Colors.white : Colors.black87,
+                                                              fontWeight: FontWeight.w400,
+                                                              height: 1.4,
+                                                            ),
+                                                          )
+                                                        : const SizedBox.shrink())),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        if (!isDeleted)
+                                          Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.center,
+                                            children: [
+                                              Text(
+                                                createdAt,
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  color: mine ? Colors.white70 : Colors.black54,
+                                                  fontWeight: FontWeight.w400,
+                                                ),
+                                              ),
+                                              if (edited) ...[
+                                                const SizedBox(width: 6),
+                                                Icon(
+                                                  Icons.edit,
+                                                  size: 12,
+                                                  color: mine ? Colors.white70 : Colors.black54,
+                                                ),
+                                                const SizedBox(width: 2),
+                                                Text(
+                                                  '(edited)',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: mine ? Colors.white70 : Colors.black54,
+                                                  ),
+                                                ),
+                                              ],
+                                              if (mine) ...[
+                                                const SizedBox(width: 6),
+                                                _tickForMessage(m),
+                                                const SizedBox(width: 4),
+                                                Builder(
+                                                  builder: (_) {
+                                                    final status =
+                                                        _msgStatusFor(m);
+                                                    if (status.isEmpty)
+                                                      return const SizedBox.shrink();
+                                                    return Text(
+                                                      status,
+                                                      style: TextStyle(
+                                                        fontSize: 11,
+                                                        color: _msgStatusColor(
+                                                          status,
+                                                        ),
+                                                        fontStyle:
+                                                            status == 'seen'
+                                                            ? FontStyle.normal
+                                                            : FontStyle.italic,
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  ),
+                            );
+                          },
+                        ),
+                  // Scroll-to-bottom FAB
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: AnimatedScale(
+                      duration: const Duration(milliseconds: 200),
+                      scale: _showScrollToBottom ? 1 : 0,
+                      child: FloatingActionButton.small(
+                        onPressed: _scrollToBottom,
+                        child: const Icon(Icons.arrow_downward),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // Typing / presence echo under the list
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 6),
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 220),
+                transitionBuilder: (c, a) =>
+                    FadeTransition(opacity: a, child: c),
+                child: Text(
+                  _peerTyping
+                      ? 'typing…'
+                      : (_peerOnline
+                            ? 'online'
+                            : (_peerPresenceAt != null
+                                  ? 'last seen ${_agoLabel(_peerPresenceAt!)}'
+                                  : 'offline')),
+                  key: ValueKey(
+                    _peerTyping.toString() +
+                        _peerOnline.toString() +
+                        (_peerPresenceAt?.millisecondsSinceEpoch.toString() ??
+                            'x'),
+                  ),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    fontStyle: _peerTyping
+                        ? FontStyle.italic
+                        : FontStyle.normal,
+                    color: _peerTyping
+                        ? Theme.of(context).colorScheme.primary
+                        : Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ),
+
+            // Composer
+            SafeArea(
+              top: false,
+              child: Container(
+                margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surface,
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(.06),
+                      blurRadius: 14,
+                      offset: const Offset(0, 6),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        // Voice record button (tap to start/stop)
+                        IconButton(
+                          tooltip: _isRecordingVoice 
+                              ? 'Tap to stop recording' 
+                              : (composerEnabled ? 'Tap to start recording voice' : 'Wait for chat acceptance'),
+                          icon: Icon(_isRecordingVoice ? Icons.mic : Icons.mic_none),
+                          color: _isRecordingVoice 
+                              ? Colors.red 
+                              : (composerEnabled ? null : Colors.grey),
+                          onPressed: (_isRecordingVoice || composerEnabled) 
+                              ? () {
+                                  if (_isRecordingVoice) {
+                                    debugPrint('Stop recording button tapped');
+                                    _stopVoiceRecording();
+                                  } else {
+                                    debugPrint('Start recording button tapped');
+                                    _startVoiceRecording();
+                                  }
+                                }
+                              : null,
+                        ),
+                        IconButton(
+                          tooltip: 'Attach file or photo',
+                          icon: const Icon(Icons.attach_file),
+                          onPressed: (_uploadingFile || !composerEnabled || _isRecordingVoice) 
+                              ? null 
+                              : _showAttachmentOptions,
+                        ),
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 4,
+                              vertical: 4,
+                            ),
+                            child: TextField(
+                              controller: _input,
+                              enabled: composerEnabled && !loading && !_isRecordingVoice,
+                              onSubmitted: (_) =>
+                                  _editingId != null ? _saveEdit() : _send(),
+                              textInputAction: TextInputAction.send,
+                              minLines: 1,
+                              maxLines: 5,
+                              decoration: InputDecoration(
+                                hintText: _isRecordingVoice
+                                    ? 'Recording...'
+                                    : (composerEnabled
+                                        ? (_editingId != null
+                                            ? 'Edit message…'
+                                            : 'Type a message…')
+                                        : 'Waiting for acceptance…'),
+                                filled: true,
+                                fillColor: _editingId != null
+                                    ? Theme.of(context).colorScheme.primaryContainer.withOpacity(0.3)
+                                    : Theme.of(context).colorScheme.surfaceVariant.withOpacity(.6),
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 12,
+                                ),
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: _editingId != null
+                                      ? BorderSide(
+                                          color: Theme.of(context).colorScheme.primary.withOpacity(0.5),
+                                          width: 1,
+                                        )
+                                      : BorderSide.none,
+                                ),
+                                enabledBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: _editingId != null
+                                      ? BorderSide(
+                                          color: Theme.of(context).colorScheme.primary.withOpacity(0.5),
+                                          width: 1,
+                                        )
+                                      : BorderSide.none,
+                                ),
+                                focusedBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: BorderSide(
+                                    color: Theme.of(context).colorScheme.primary,
+                                    width: 2,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Emoji',
+                          icon: Icon(_showEmojiPicker ? Icons.keyboard : Icons.emoji_emotions_outlined),
+                          onPressed: composerEnabled && !_isRecordingVoice ? () {
+                            setState(() {
+                              _showEmojiPicker = !_showEmojiPicker;
+                            });
+                          } : null,
+                        ),
+                        // Cancel button when editing
+                        if (_editingId != null)
+                          IconButton(
+                            tooltip: 'Cancel edit',
+                            icon: const Icon(Icons.close),
+                            color: Colors.grey.shade600,
+                            onPressed: () => _cancelEdit(),
+                          ),
+                        // Send / Save button with animated swap
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 180),
+                          transitionBuilder: (c, a) => RotationTransition(
+                            turns: a,
+                            child: FadeTransition(opacity: a, child: c),
+                          ),
+                          child: _isRecordingVoice
+                              ? IconButton(
+                                  key: const ValueKey('stop'),
+                                  icon: const Icon(Icons.stop, color: Colors.red),
+                                  onPressed: () => _stopVoiceRecording(),
+                                )
+                              : IconButton(
+                                  key: ValueKey(_editingId != null ? 'save' : 'send'),
+                                  icon: Icon(
+                                    _editingId != null ? Icons.check : Icons.send,
+                                    color: (canSend)
+                                        ? Theme.of(context).colorScheme.primary
+                                        : Theme.of(context).disabledColor,
+                                  ),
+                                  tooltip: _editingId != null ? 'Save changes' : 'Send message',
+                                  onPressed: canSend
+                                      ? () => _editingId != null ? _saveEdit() : _send()
+                                      : null,
+                                ),
+                        ),
+                      ],
+                    ),
+                    // Voice recording indicator
+                    if (_isRecordingVoice)
+                      ValueListenableBuilder<int>(
+                        valueListenable: _voiceService.durationNotifier,
+                        builder: (context, duration, _) {
+                          return Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.mic, color: Colors.red, size: 20),
+                                const SizedBox(width: 8),
+                                Text(
+                                  _voiceService.formatDuration(duration),
+                                  style: const TextStyle(
+                                    color: Colors.red,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const Spacer(),
+                                TextButton(
+                                  onPressed: _cancelVoiceRecording,
+                                  child: const Text('Cancel'),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            // Emoji picker
+            if (_showEmojiPicker)
+              EmojiPickerWidget(
+                onEmojiSelected: (emoji) {
+                  _input.text = _input.text + emoji;
+                  setState(() {
+                    _hasText = _input.text.trim().isNotEmpty;
+                  });
+                },
+                onBackspace: () {
+                  if (_input.text.isNotEmpty) {
+                    _input.text = _input.text.substring(0, _input.text.length - 1);
+                    setState(() {
+                      _hasText = _input.text.trim().isNotEmpty;
+                    });
+                  }
+                },
+              ),
+          ],
+        ),
+      ),
+      // Floating action button for selected messages
+      floatingActionButton: _isSelectMode && _selectedMessageIds.isNotEmpty
+          ? FloatingActionButton.extended(
+              onPressed: () {
+                // Show action menu for selected messages
+                showModalBottomSheet(
+                  context: context,
+                  backgroundColor: Colors.transparent,
+                  builder: (context) => Container(
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).scaffoldBackgroundColor,
+                      borderRadius: const BorderRadius.only(
+                        topLeft: Radius.circular(20),
+                        topRight: Radius.circular(20),
+                      ),
+                    ),
+                    child: SafeArea(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            margin: const EdgeInsets.only(top: 12, bottom: 8),
+                            width: 40,
+                            height: 4,
+                            decoration: BoxDecoration(
+                              color: Colors.grey.shade300,
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                          ListTile(
+                            leading: const Icon(Icons.delete_outline, color: Colors.red),
+                            title: Text(
+                              'Delete ${_selectedMessageIds.length} message${_selectedMessageIds.length > 1 ? 's' : ''}',
+                              style: const TextStyle(color: Colors.red, fontWeight: FontWeight.w500),
+                            ),
+                            onTap: () {
+                              Navigator.pop(context);
+                              _deleteSelectedMessages();
+                            },
+                          ),
+                          ListTile(
+                            leading: Icon(Icons.forward, color: Theme.of(context).colorScheme.primary),
+                            title: const Text('Forward'),
+                            onTap: () {
+                              Navigator.pop(context);
+                              _forwardSelectedMessages();
+                            },
+                          ),
+                          ListTile(
+                            leading: Icon(Icons.content_copy, color: Theme.of(context).colorScheme.primary),
+                            title: const Text('Copy'),
+                            onTap: () {
+                              Navigator.pop(context);
+                              _copySelectedMessages();
+                            },
+                          ),
+                          SizedBox(height: MediaQuery.of(context).padding.bottom),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.more_vert),
+              label: Text('${_selectedMessageIds.length}'),
+              backgroundColor: Theme.of(context).colorScheme.primary,
+            )
+          : null,
+    );
+  }
+
+  String _fmtTime(String? iso) {
+    if (iso == null || iso.isEmpty) return '';
+    final dt = DateTime.tryParse(iso);
+    if (dt == null) return '';
+    final local = dt.toLocal();
+    final h = local.hour == 0
+        ? 12
+        : (local.hour > 12 ? local.hour - 12 : local.hour);
+    final mm = local.minute.toString().padLeft(2, '0');
+    final ampm = local.hour >= 12 ? 'pm' : 'am';
+    return '$h:$mm $ampm';
+  }
+
+  /// Build call activity message widget
+  Widget _buildCallActivityMessage(Map<String, dynamic> m, bool isMe) {
+    try {
+      // Parse call log data from message metadata
+      // IMPORTANT: We use the metadata fields, NOT the message text
+      final callTypeStr = m['callType']?.toString() ?? 'outgoing';
+      final callStatusStr = m['callStatus']?.toString() ?? 'completed';
+      final isVideoCall = m['isVideoCall'] == true;
+      final startTimeStr = m['callStartTime']?.toString() ?? m['createdAt']?.toString();
+      final durationStr = m['callDuration']?.toString();
+      
+      // Parse call type and status
+      final callType = CallType.fromString(callTypeStr);
+      final callStatus = CallStatus.fromString(callStatusStr);
+      
+      debugPrint('Building call activity: type=$callTypeStr, status=$callStatusStr, isVideo=$isVideoCall');
+      
+      DateTime? startTime;
+      Duration? duration;
+      
+      if (startTimeStr != null) {
+        startTime = DateTime.tryParse(startTimeStr);
+      }
+      
+      if (durationStr != null) {
+        final seconds = int.tryParse(durationStr);
+        if (seconds != null && seconds > 0) {
+          duration = Duration(seconds: seconds);
+        }
+      }
+
+      // IMPORTANT: Flip the call type based on who receives the message
+      // If the message says "outgoing" but it's from someone else, it's incoming from our perspective
+      final messageFrom = m['from']?.toString() ?? '';
+      final isActuallyOutgoing = callType == CallType.outgoing && messageFrom == myId;
+      final actualCallType = isActuallyOutgoing ? CallType.outgoing : CallType.incoming;
+      
+      // Create CallLog object with parsed data (flipped perspective)
+      final callLog = CallLog(
+        id: m['_id']?.toString() ?? m['id']?.toString() ?? '',
+        peerId: peerId ?? '',
+        peerName: widget.peerName,
+        peerEmail: widget.partnerEmail,
+        type: actualCallType, // Use flipped call type based on perspective
+        status: callStatus, // Use parsed call status - THIS IS KEY!
+        startTime: startTime ?? DateTime.now(),
+        duration: duration,
+        isVideoCall: isVideoCall,
+      );
+
+      // Format exact timestamp (no "just now" formatting)
+      String? formattedTime;
+      if (startTime != null) {
+        final localTime = startTime.toLocal();
+        final hour = localTime.hour == 0
+            ? 12
+            : (localTime.hour > 12 ? localTime.hour - 12 : localTime.hour);
+        final minute = localTime.minute.toString().padLeft(2, '0');
+        final ampm = localTime.hour >= 12 ? 'pm' : 'am';
+        formattedTime = '$hour:$minute $ampm';
+      } else {
+        // Fallback to message timestamp
+        final createdAt = m['createdAt']?.toString();
+        if (createdAt != null) {
+          formattedTime = _fmtTime(createdAt);
+        }
+      }
+
+      // For Viber-style: outgoing calls appear on RIGHT, incoming on LEFT
+      // Use the flipped call type to determine alignment
+      return CallActivityMessage(
+        callLog: callLog, // Widget will generate text based on callLog.status and type
+        isMe: actualCallType == CallType.outgoing, // Outgoing = RIGHT, Incoming = LEFT
+        timestamp: formattedTime,
+      );
+    } catch (e) {
+      debugPrint('Error building call activity message: $e');
+      // Fallback to text message if parsing fails
+      return Align(
+        alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.grey.shade300,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Text(
+            m['text']?.toString() ?? 'Call activity',
+            style: const TextStyle(
+              color: Colors.black87,
+              fontSize: 14,
+            ),
+          ),
+        ),
+      );
+    }
+  }
+
+  Widget _tickForMessage(Map<String, dynamic> m) {
+    final createdIso = (m['createdAt'] ?? '').toString();
+    final created = DateTime.tryParse(createdIso);
+    if (created == null) return const SizedBox.shrink();
+
+    final delivered =
+        _deliveredUpToPeer != null && !created.isAfter(_deliveredUpToPeer!);
+    final read = _readUpToPeer != null && !created.isAfter(_readUpToPeer!);
+
+    final icon = (delivered || read) ? Icons.done_all : Icons.done;
+    final color = read
+        ? Colors.white
+        : (delivered ? Colors.white70 : Colors.white54);
+
+    return Icon(icon, size: 16, color: color);
+  }
+
+  Future<void> _startVoiceRecording() async {
+    debugPrint('_startVoiceRecording called, composerEnabled: $composerEnabled');
+    if (!composerEnabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please wait for chat to be accepted')),
+        );
+      }
+      return;
+    }
+    
+    if (_isRecordingVoice) {
+      debugPrint('Already recording, ignoring');
+      return;
+    }
+    
+    // Request microphone permission and start recording
+    try {
+      debugPrint('Starting recording...');
+      final started = await _voiceService.startRecording();
+      debugPrint('Recording started: $started');
+      
+      if (started && mounted) {
+        setState(() {
+          _isRecordingVoice = true;
+          _showEmojiPicker = false; // Hide emoji picker when recording
+        });
+        debugPrint('Recording state updated: $_isRecordingVoice');
+      } else {
+        if (mounted) {
+          final hasPermission = await _voiceService.hasMicrophonePermission();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                hasPermission 
+                    ? 'Failed to start recording. Please try again.'
+                    : 'Microphone permission denied. Please grant microphone access in settings.',
+              ),
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Error in _startVoiceRecording: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error starting recording: $e'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _stopVoiceRecording() async {
+    debugPrint('_stopVoiceRecording called, _isRecordingVoice: $_isRecordingVoice');
+    if (!_isRecordingVoice) {
+      debugPrint('Not recording, returning');
+      return;
+    }
+    
+    if (mounted) {
+      setState(() {
+        _isRecordingVoice = false;
+      });
+    }
+    
+    final audioPath = await _voiceService.stopRecording();
+    debugPrint('Recording stopped, path: $audioPath');
+
+    if (audioPath == null || audioPath.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Recording failed - no audio file created')),
+        );
+      }
+      return;
+    }
+
+    // Upload and send voice message
+    setState(() => _uploadingFile = true);
+    try {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                SizedBox(width: 12),
+                Text('Sending voice message...'),
+              ],
+            ),
+            duration: Duration(seconds: 30),
+          ),
+        );
+      }
+
+      final fileUrl = await _voiceService.uploadAndGetUrl(audioPath);
+      if (!mounted) {
+        setState(() => _uploadingFile = false);
+        return;
+      }
+
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+      if (fileUrl != null) {
+        final duration = _voiceService.recordingDuration;
+        await _send(
+          fileUrl: fileUrl,
+          fileName: 'voice_${DateTime.now().millisecondsSinceEpoch}.m4a',
+          fileType: 'audio',
+          audioDuration: duration,
+        );
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Failed to upload voice message')),
+          );
+        }
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    } finally {
+      setState(() => _uploadingFile = false);
+    }
+  }
+
+  Future<void> _cancelVoiceRecording() async {
+    await _voiceService.cancelRecording();
+    if (mounted) {
+      setState(() {
+        _isRecordingVoice = false;
+      });
+    }
+  }
+  
+  Future<void> _forwardSelectedMessages() async {
+    // TODO: Implement forward selected messages
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Forward feature coming soon')),
+    );
+  }
+  
+  Future<void> _copySelectedMessages() async {
+    final selectedMessages = _items.where((m) {
+      final id = (m['_id'] ?? m['id'] ?? '').toString();
+      return _selectedMessageIds.contains(id);
+    }).toList();
+    
+    final texts = selectedMessages
+        .map((m) => m['text']?.toString() ?? '')
+        .where((t) => t.isNotEmpty)
+        .join('\n');
+    
+    if (texts.isNotEmpty) {
+      await Clipboard.setData(ClipboardData(text: texts));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('${selectedMessages.length} message${selectedMessages.length > 1 ? 's' : ''} copied'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+}

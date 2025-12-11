@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Allow cleartext HTTP traffic for local development server -->
+    <!-- This is necessary for audio file playback from HTTP URLs -->
+    <!-- Required for real device connections to development server -->
+    <!-- 
+    IMPORTANT: This allows cleartext HTTP for ALL domains.
+    For production, you MUST change this to only allow specific domains.
+    -->
+    
+    <!-- Base configuration: Allow cleartext for ALL domains (development only) -->
+    <!-- This is required because Android MediaPlayer needs explicit permission -->
+    <!-- For production, set to "false" and use domain-config below -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+    
+    <!-- Specific domain configs for common development scenarios -->
+    <!-- These are redundant with base-config but kept for clarity -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain> <!-- Android emulator -->
+    </domain-config>
+    
+    <!-- Your development server IP and common local network IPs -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">192.168.2.135</domain>
+        <domain includeSubdomains="true">192.168.1.1</domain>
+        <domain includeSubdomains="true">192.168.0.1</domain>
+        <domain includeSubdomains="true">10.0.0.1</domain>
+    </domain-config>
+</network-security-config>
+
