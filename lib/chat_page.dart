@@ -2973,7 +2973,8 @@ class _ChatPageState extends State<ChatPage>
                             final reversedIndex = _items.length - 1 - i;
                             final m = _items[reversedIndex];
                             final id = (m['_id'] ?? m['id'] ?? '').toString();
-                            final mine = m['from']?.toString() == myId;
+                            final fromStr = (m['from'] ?? m['sender'])?.toString();
+                            final mine = fromStr == myId;
                             final isDeleted =
                                 (m['deleted'] == true) ||
                                 (m['deletedForMe'] == true);
@@ -3134,6 +3135,7 @@ class _ChatPageState extends State<ChatPage>
                                       ),
                                     // Message content (call activity or regular message)
                                     // Make entire area tappable in select mode for call activity messages
+                                    // If call activity is selectable, cover it
                                     if (_isSelectMode && isCallActivity)
                                       Positioned.fill(
                                         child: GestureDetector(
@@ -3141,274 +3143,218 @@ class _ChatPageState extends State<ChatPage>
                                           onTap: () => _toggleMessageSelection(id),
                                         ),
                                       ),
-                                    Align(
-                                      alignment: isCallActivity
-                                          ? Alignment.center
-                                          : (mine ? Alignment.centerRight : Alignment.centerLeft),
-                                      child: Padding(
-                                        padding: EdgeInsets.only(
-                                          left: _isSelectMode ? 48 : 0,
-                                          right: 0,
-                                        ),
-                                        child: isCallActivity
-                                            ? IgnorePointer(
-                                                ignoring: _isSelectMode,
-                                                child: _buildCallActivityMessage(
-                                                  m,
-                                                  mine,
-                                                  onTap: null, // Don't pass onTap when in select mode
-                                                ),
-                                              )
-                                            : Row(
-                                                mainAxisSize: MainAxisSize.min,
-                                                crossAxisAlignment: CrossAxisAlignment.end,
-                                                children: [
-                                                  // Profile picture for received messages (left side)
-                                                  if (!mine && !isCallActivity)
-                                                    Padding(
-                                                      padding: const EdgeInsets.only(
-                                                        right: 8,
-                                                        bottom: 4,
-                                                        left: 8,
-                                                      ),
-                                                      child: ClipOval(
-                                                        child: _peerProfile?['avatarUrl'] != null &&
-                                                                (_peerProfile!['avatarUrl']?.toString() ?? '').isNotEmpty
-                                                            ? CachedNetworkImage(
-                                                                imageUrl: _peerProfile!['avatarUrl'].toString(),
-                                                                width: 36,
-                                                                height: 36,
-                                                                fit: BoxFit.cover,
-                                                                errorWidget: (context, url, error) => CircleAvatar(
-                                                                  radius: 18,
-                                                                  backgroundColor: Colors.grey[300],
-                                                                  child: Text(
-                                                                    (widget.peerName ?? widget.partnerEmail)
-                                                                        .substring(0, 1)
-                                                                        .toUpperCase(),
-                                                                    style: const TextStyle(
-                                                                      color: Colors.white,
-                                                                      fontSize: 14,
-                                                                      fontWeight: FontWeight.bold,
+                                    // Message row with alignment
+                                    SizedBox(
+                                      width: double.infinity,
+                                      child: Align(
+                                        alignment: isCallActivity
+                                            ? Alignment.center
+                                            : (mine ? Alignment.centerRight : Alignment.centerLeft),
+                                        child: Padding(
+                                          padding: EdgeInsets.only(
+                                            left: _isSelectMode ? 48 : 0,
+                                            right: 0,
+                                          ),
+                                          child: isCallActivity
+                                              ? IgnorePointer(
+                                                  ignoring: _isSelectMode,
+                                                  child: _buildCallActivityMessage(
+                                                    m,
+                                                    mine,
+                                                    onTap: null,
+                                                  ),
+                                                )
+                                              : Row(
+                                                  mainAxisSize: MainAxisSize.min,
+                                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                                  children: [
+                                                    // Avatar for received messages
+                                                    if (!mine && !isCallActivity)
+                                                      Padding(
+                                                        padding: const EdgeInsets.only(
+                                                          right: 8,
+                                                          bottom: 4,
+                                                          left: 8,
+                                                        ),
+                                                        child: ClipOval(
+                                                          child: _peerProfile?['avatarUrl'] != null &&
+                                                                  (_peerProfile!['avatarUrl']?.toString() ?? '').isNotEmpty
+                                                              ? CachedNetworkImage(
+                                                                  imageUrl: _peerProfile!['avatarUrl'].toString(),
+                                                                  width: 36,
+                                                                  height: 36,
+                                                                  fit: BoxFit.cover,
+                                                                  errorWidget: (context, url, error) => CircleAvatar(
+                                                                    radius: 18,
+                                                                    backgroundColor: Colors.grey[300],
+                                                                    child: Builder(
+                                                                      builder: (_) {
+                                                                        final fallback = (widget.peerName ?? widget.partnerEmail ?? '').trim();
+                                                                        final initial = fallback.isNotEmpty ? fallback[0].toUpperCase() : '?';
+                                                                        return Text(
+                                                                          initial,
+                                                                          style: const TextStyle(
+                                                                            color: Colors.white,
+                                                                            fontSize: 14,
+                                                                            fontWeight: FontWeight.bold,
+                                                                          ),
+                                                                        );
+                                                                      },
                                                                     ),
                                                                   ),
-                                                                ),
-                                                                placeholder: (context, url) => CircleAvatar(
+                                                                  placeholder: (context, url) => CircleAvatar(
+                                                                    radius: 18,
+                                                                    backgroundColor: Colors.grey[300],
+                                                                    child: const SizedBox(
+                                                                      width: 18,
+                                                                      height: 18,
+                                                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                                                    ),
+                                                                  ),
+                                                                )
+                                                              : CircleAvatar(
                                                                   radius: 18,
                                                                   backgroundColor: Colors.grey[300],
-                                                                  child: const SizedBox(
-                                                                    width: 18,
-                                                                    height: 18,
-                                                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                                                  child: Builder(
+                                                                    builder: (_) {
+                                                                      final fallback = (widget.peerName ?? widget.partnerEmail ?? '').trim();
+                                                                      final initial = fallback.isNotEmpty ? fallback[0].toUpperCase() : '?';
+                                                                      return Text(
+                                                                        initial,
+                                                                        style: const TextStyle(
+                                                                          color: Colors.white,
+                                                                          fontSize: 14,
+                                                                          fontWeight: FontWeight.bold,
+                                                                        ),
+                                                                      );
+                                                                    },
                                                                   ),
                                                                 ),
-                                                              )
-                                                            : CircleAvatar(
-                                                                radius: 18,
-                                                                backgroundColor: Colors.grey[300],
-                                                                child: Text(
-                                                                  (widget.peerName ?? widget.partnerEmail)
-                                                                      .substring(0, 1)
-                                                                      .toUpperCase(),
-                                                                  style: const TextStyle(
-                                                                    color: Colors.white,
-                                                                    fontSize: 14,
-                                                                    fontWeight: FontWeight.bold,
-                                                                  ),
-                                                                ),
-                                                              ),
+                                                        ),
                                                       ),
-                                                    ),
-                                                  Flexible(
-                                                    child: GestureDetector(
-                                  onTap: _isSelectMode
-                                      ? () => _toggleMessageSelection(id)
-                                      : null,
-                                  // Swipe to reply gesture
-                                  onHorizontalDragStart: (!isDeleted &&
-                                          composerEnabled &&
-                                          !deleting &&
-                                          !isCallActivity &&
-                                          !_isSelectMode)
-                                      ? (DragStartDetails details) {
-                                          setState(() {
-                                            _swipingMessageId = id;
-                                            _swipeOffset = 0.0;
-                                          });
-                                        }
-                                      : null,
-                                  onHorizontalDragUpdate: (!isDeleted &&
-                                          composerEnabled &&
-                                          !deleting &&
-                                          !isCallActivity &&
-                                          !_isSelectMode &&
-                                          _swipingMessageId == id)
-                                      ? (DragUpdateDetails details) {
-                                          // For received messages (mine = false), swipe left (negative)
-                                          // For sent messages (mine = true), swipe right (positive)
-                                          final delta = details.primaryDelta ?? 0.0;
-                                          final newOffset = _swipeOffset + delta;
-                                          
-                                          // Constrain swipe direction based on message alignment
-                                          if (mine) {
-                                            // Sent messages: only allow right swipe (positive)
-                                            if (newOffset >= 0 && newOffset <= _swipeThreshold) {
-                                              setState(() {
-                                                _swipeOffset = newOffset;
-                                              });
-                                            }
-                                          } else {
-                                            // Received messages: only allow left swipe (negative)
-                                            if (newOffset <= 0 && newOffset >= -_swipeThreshold) {
-                                              setState(() {
-                                                _swipeOffset = newOffset;
-                                              });
-                                            }
-                                          }
-                                        }
-                                      : null,
-                                  onHorizontalDragEnd: (!isDeleted &&
-                                          composerEnabled &&
-                                          !deleting &&
-                                          !isCallActivity &&
-                                          !_isSelectMode &&
-                                          _swipingMessageId == id)
-                                      ? (DragEndDetails details) {
-                                          // Check if swipe threshold is reached
-                                          final absOffset = _swipeOffset.abs();
-                                          if (absOffset >= _swipeThreshold * 0.6) {
-                                            // Trigger reply
-                                            _startReply(m);
-                                            // Haptic feedback
-                                            HapticFeedback.lightImpact();
-                                          }
-                                          
-                                          // Reset swipe state with animation
-                                          setState(() {
-                                            _swipeOffset = 0.0;
-                                            _swipingMessageId = null;
-                                          });
-                                        }
-                                      : null,
-                                  onLongPressStart:
-                                      (!isDeleted &&
-                                          composerEnabled &&
-                                          !deleting &&
-                                          !isCallActivity) // Call activity messages are NOT editable/deletable
-                                      ? (LongPressStartDetails details) async {
-                                          if (_isSelectMode) {
-                                            _toggleMessageSelection(id);
-                                            return;
-                                          }
-                                          
-                                          final action =
-                                                    await _showMessageActionMenu(
-                                                      m,
-                                                      mine,
-                                                      details.globalPosition,
-                                                    );
-                                          
-                                          if (action == 'reply') {
-                                            _startReply(m);
-                                          } else if (action == 'copy') {
-                                            await _copyMessage(m);
-                                                } else if (action ==
-                                                    'forward') {
-                                            await _forwardMessage(m);
-                                          } else if (action == 'info') {
-                                            _showMessageInfo(m);
-                                          } else if (action == 'select') {
-                                            // Enter selection mode and select this message
-                                            setState(() {
-                                              _isSelectMode = true;
-                                              _selectedMessageIds.add(id);
-                                            });
-                                          } else if (action == 'edit') {
-                                            _startEdit(m);
-                                          } else if (action == 'delete') {
-                                            // Viber-style: Only show "Delete for everyone" for own messages
-                                            final deleteType = await showDialog<String>(
-                                              context: context,
-                                              builder: (_) => AlertDialog(
-                                                title: Text(
-                                                        mine
-                                                            ? 'Delete message?'
-                                                            : 'Delete message for you?',
-                                                ),
-                                                content: Text(
-                                                  mine
-                                                      ? 'This message will be deleted. Choose an option:'
-                                                      : 'This message will be deleted only for you. The other person will still see it.',
-                                                ),
-                                                actions: [
-                                                  TextButton(
-                                                    onPressed: () =>
-                                                              Navigator.pop(
-                                                                context,
-                                                                null,
-                                                              ),
-                                                          child: const Text(
-                                                            'Cancel',
-                                                          ),
-                                                  ),
-                                                  TextButton(
-                                                    onPressed: () =>
-                                                              Navigator.pop(
-                                                                context,
-                                                                'me',
-                                                              ),
-                                                          style:
-                                                              TextButton.styleFrom(
-                                                                foregroundColor:
-                                                                    Colors
-                                                                        .orange,
-                                                    ),
-                                                          child: const Text(
-                                                            'Delete for me',
-                                                          ),
-                                                  ),
-                                                  // Only show "Delete for everyone" for own messages
-                                                  if (mine)
-                                                    FilledButton(
-                                                      onPressed: () =>
-                                                                Navigator.pop(
-                                                                  context,
-                                                                  'everyone',
-                                                                ),
-                                                            style:
-                                                                FilledButton.styleFrom(
-                                                                  backgroundColor:
-                                                                      Colors
-                                                                          .red,
-                                                      ),
-                                                            child: const Text(
-                                                              'Delete for everyone',
-                                                            ),
-                                                    ),
-                                                ],
-                                              ),
-                                            );
-                                            if (deleteType == 'me') {
-                                                    await _deleteMessage(
-                                                      id,
-                                                      deleteForEveryone: false,
-                                                      isMine: mine,
-                                                    );
-                                                  } else if (deleteType ==
-                                                          'everyone' &&
-                                                      mine) {
-                                                    await _deleteMessage(
-                                                      id,
-                                                      deleteForEveryone: true,
-                                                      isMine: mine,
-                                                    );
-                                            }
-                                          }
-                                        }
-                                      : null,
-                                  child: Stack(
-                                    clipBehavior: Clip.none,
-                                    children: [
+                                                    // Message bubble with gestures
+                                                    Flexible(
+                                                      child: GestureDetector(
+                                                        onTap: _isSelectMode ? () => _toggleMessageSelection(id) : null,
+                                                        onHorizontalDragStart: (!isDeleted &&
+                                                                composerEnabled &&
+                                                                !deleting &&
+                                                                !isCallActivity &&
+                                                                !_isSelectMode)
+                                                            ? (DragStartDetails details) {
+                                                                setState(() {
+                                                                  _swipingMessageId = id;
+                                                                  _swipeOffset = 0.0;
+                                                                });
+                                                              }
+                                                            : null,
+                                                        onHorizontalDragUpdate: (!isDeleted &&
+                                                                composerEnabled &&
+                                                                !deleting &&
+                                                                !isCallActivity &&
+                                                                !_isSelectMode &&
+                                                                _swipingMessageId == id)
+                                                            ? (DragUpdateDetails details) {
+                                                                final delta = details.primaryDelta ?? 0.0;
+                                                                final newOffset = _swipeOffset + delta;
+                                                                if (mine) {
+                                                                  if (newOffset >= 0 && newOffset <= _swipeThreshold) {
+                                                                    setState(() => _swipeOffset = newOffset);
+                                                                  }
+                                                                } else {
+                                                                  if (newOffset <= 0 && newOffset >= -_swipeThreshold) {
+                                                                    setState(() => _swipeOffset = newOffset);
+                                                                  }
+                                                                }
+                                                              }
+                                                            : null,
+                                                        onHorizontalDragEnd: (!isDeleted &&
+                                                                composerEnabled &&
+                                                                !deleting &&
+                                                                !isCallActivity &&
+                                                                !_isSelectMode &&
+                                                                _swipingMessageId == id)
+                                                            ? (DragEndDetails details) {
+                                                                final absOffset = _swipeOffset.abs();
+                                                                if (absOffset >= _swipeThreshold * 0.6) {
+                                                                  _startReply(m);
+                                                                  HapticFeedback.lightImpact();
+                                                                }
+                                                                setState(() {
+                                                                  _swipeOffset = 0.0;
+                                                                  _swipingMessageId = null;
+                                                                });
+                                                              }
+                                                            : null,
+                                                        onLongPressStart: (!isDeleted &&
+                                                                composerEnabled &&
+                                                                !deleting &&
+                                                                !isCallActivity)
+                                                            ? (LongPressStartDetails details) async {
+                                                                if (_isSelectMode) {
+                                                                  _toggleMessageSelection(id);
+                                                                  return;
+                                                                }
+                                                                final action = await _showMessageActionMenu(
+                                                                  m,
+                                                                  mine,
+                                                                  details.globalPosition,
+                                                                );
+                                                                if (action == 'reply') {
+                                                                  _startReply(m);
+                                                                } else if (action == 'copy') {
+                                                                  await _copyMessage(m);
+                                                                } else if (action == 'forward') {
+                                                                  await _forwardMessage(m);
+                                                                } else if (action == 'info') {
+                                                                  _showMessageInfo(m);
+                                                                } else if (action == 'select') {
+                                                                  setState(() {
+                                                                    _isSelectMode = true;
+                                                                    _selectedMessageIds.add(id);
+                                                                  });
+                                                                } else if (action == 'edit') {
+                                                                  _startEdit(m);
+                                                                } else if (action == 'delete') {
+                                                                  final deleteType = await showDialog<String>(
+                                                                    context: context,
+                                                                    builder: (_) => AlertDialog(
+                                                                      title: Text(mine ? 'Delete message?' : 'Delete message for you?'),
+                                                                      content: Text(
+                                                                        mine
+                                                                            ? 'This message will be deleted. Choose an option:'
+                                                                            : 'This message will be deleted only for you. The other person will still see it.',
+                                                                      ),
+                                                                      actions: [
+                                                                        TextButton(
+                                                                          onPressed: () => Navigator.pop(context, null),
+                                                                          child: const Text('Cancel'),
+                                                                        ),
+                                                                        TextButton(
+                                                                          onPressed: () => Navigator.pop(context, 'me'),
+                                                                          style: TextButton.styleFrom(foregroundColor: Colors.orange),
+                                                                          child: const Text('Delete for me'),
+                                                                        ),
+                                                                        if (mine)
+                                                                          FilledButton(
+                                                                            onPressed: () => Navigator.pop(context, 'everyone'),
+                                                                            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                                                                            child: const Text('Delete for everyone'),
+                                                                          ),
+                                                                      ],
+                                                                    ),
+                                                                  );
+                                                                  if (deleteType == 'me') {
+                                                                    await _deleteMessage(id, deleteForEveryone: false, isMine: mine);
+                                                                  } else if (deleteType == 'everyone' && mine) {
+                                                                    await _deleteMessage(id, deleteForEveryone: true, isMine: mine);
+                                                                  }
+                                                                }
+                                                              }
+                                                            : null,
+                                                        child: Stack(
+                                                          clipBehavior: Clip.none,
+                                                          children: [
                                       // Reply icon (shown behind message during swipe)
                                       if (_swipingMessageId == id && _swipeOffset.abs() > 10)
                                         Positioned(
